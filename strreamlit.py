@@ -1,78 +1,70 @@
 import streamlit as st
 import openai
 import os
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 from dotenv import load_dotenv
 
 load_dotenv()
 
 openai.api_key = os.getenv('OPENAI_API_KEY')
-
 PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
 PINECONE_ENVIRONMENT = "us-east-1" 
 INDEX_NAME = "zoko-chat-index"
 EMBED_MODEL = "text-embedding-ada-002"
-CHAT_MODEL = "gpt-3.5-turbo"          
-TOP_K = 3                           
+CHAT_MODEL = "gpt-3.5-turbo" 
+TOP_K = 140
 
 @st.cache_resource
 def init_pinecone_index():
-    """
-    Create/connect to the Pinecone index. 
-    We assume it's already populated with your embedded messages.
-    """
     pc = Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
     existing = [idx.name for idx in pc.list_indexes()]
-
-    if INDEX_NAME not in existing:
-        st.error(f"Pinecone index '{INDEX_NAME}' does not exist. "
-                 f"Create or populate it first.")
-        return None
-
-    return pc.Index(INDEX_NAME)
-
-# ---------------------------
-# 3) HELPER FUNCTIONS
-# ---------------------------
+    return None if INDEX_NAME not in existing else pc.Index(INDEX_NAME)
 
 def get_embedding(text: str, model: str = EMBED_MODEL) -> list:
-    """Create an embedding vector for the given text using OpenAI."""
-    resp = openai.Embedding.create(
-        model=model,
-        input=[text]
-    )
-    return resp["data"][0]["embedding"]
+    return openai.Embedding.create(model=model, input=[text])["data"][0]["embedding"]
 
-def semantic_search(query: str, pine_index, top_k: int = TOP_K):
-    """
-    1) Embeds 'query' with OpenAI
-    2) Searches Pinecone
-    3) Returns the raw matches (with metadata)
-    """
+def query_and_analyze(query: str, pine_index, model=CHAT_MODEL):
     query_vector = get_embedding(query)
-    result = pine_index.query(
+    results = pine_index.query(
         vector=query_vector,
-        top_k=top_k,
+        top_k=TOP_K,
         include_metadata=True
     )
-    return result
+    
+    if not results.get("matches"):
+        return "No relevant matches found in the database."
 
-def llm_analysis(context_texts: list, question: str, model=CHAT_MODEL) -> str:
-    """
-    Feed top contexts + question to GPT and return the response.
-    """
-    context_str = "\n".join(context_texts)
+    context_data = []
+    for match in results["matches"]:
+        metadata = match["metadata"]
+        context_data.append({
+            "from_user": metadata.get("from_user"),
+            "from_channel": metadata.get("from_channel_id"),
+            "to_user": metadata.get("to_user"),
+            "to_channel": metadata.get("to_channel_id"),
+            "date": metadata.get("date"),
+            "message": metadata.get("original_text"),
+            "chat_label": metadata.get("chat_label"),
+            "score": match.get("score")
+        })
 
-    system_prompt = "You are a helpful assistant that interprets these user messages and provides a detailed answer."
+    system_prompt = """You are an advanced chat analyst capable of:
+    1. Numerical analysis (counting unique numbers, users, message patterns)
+    2. Text analysis (message content, sentiment, patterns)
+    3. Temporal analysis (dates, frequencies, trends)
+    4. Relationship analysis (user interactions, conversation flows)
+    
+    Extract and analyze exactly what is asked in the query. 
+    For counts, provide specific numbers.
+    For patterns, provide concrete examples.
+    Be precise and data-driven in your analysis."""
 
-    user_prompt = f"""Here are some chat messages from our data:
+    user_prompt = f"""Data Context:
+{context_data}
 
-{context_str}
+Query: {query}
 
-Question: {question}
-
-Please provide a thorough, detailed, but concise answer or summary.
-"""
+Analyze the data to answer this query. If counting or identifying patterns, be thorough and exact."""
 
     response = openai.ChatCompletion.create(
         model=model,
@@ -80,56 +72,30 @@ Please provide a thorough, detailed, but concise answer or summary.
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        temperature=0.5
+        temperature=0.2 
     )
+    
     return response["choices"][0]["message"]["content"].strip()
 
 def main():
-    st.title("Zoko Chat LLM Analysis")
-
+    st.title("Advanced Chat Analysis")
+    
     pine_index = init_pinecone_index()
     if pine_index is None:
+        st.error("Pinecone index not found.")
         return
 
-    st.write("Enter a query or question about the stored WhatsApp chats. "
-             "We will perform semantic search on the embedded messages, "
-             "then pass the top matches to GPT for a detailed answer.")
-
-    user_query = st.text_input("Your Query or Prompt", "")
-    if st.button("Search & Analyze"):
+    st.write("Ask anything about the chats - users, patterns, numbers, messages, dates, etc.")
+    
+    user_query = st.text_input("Your Query", "")
+    if st.button("Analyze"):
         if not user_query.strip():
-            st.warning("Please enter a query first.")
+            st.warning("Please enter a query.")
             return
 
-        st.info(f"Semantic searching for: '{user_query}' ...")
-        results = semantic_search(user_query, pine_index, top_k=TOP_K)
-
-        if "matches" not in results or not results["matches"]:
-            st.warning("No relevant matches found in Pinecone.")
-            return
-
-        context_texts = []
-        for match in results["matches"]:
-            meta = match["metadata"]
-            from_user = meta.get("from_user", "")
-            to_user   = meta.get("to_user", "")
-            date      = meta.get("date", "")
-            original  = meta.get("original_text", "")
-            score     = match.get("score", 0)
-
-            st.write(f"**Match ID**: {match['id']}, **Score**: {score:.4f}")
-            st.write(f"From: {from_user}  |  To: {to_user}  |  Date: {date}")
-            st.write(f"Message: {original}")
-            st.write("---")
-
-            # Collect for LLM context
-            context_texts.append(
-                f"From: {from_user}\nTo: {to_user}\nDate: {date}\nMessage: {original}"
-            )
-
-        st.info("Analyzing with GPT...")
-        answer = llm_analysis(context_texts, user_query)
-        st.success("**Answer:** " + answer)
+        with st.spinner("Analyzing..."):
+            answer = query_and_analyze(user_query, pine_index)
+            st.success("**Analysis:** " + answer)
 
 if __name__ == "__main__":
     main()
